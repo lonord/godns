@@ -76,9 +76,11 @@ func (ls LogSettings) LogLevel() int {
 }
 
 type CacheSettings struct {
-	Backend  string
-	Expire   int
-	Maxcount int
+	Backend    string
+	Expire     int
+	Refresh    bool
+	Maxcount   int
+	NoNegative bool `toml:"no-negative"`
 }
 
 type HostsSettings struct {

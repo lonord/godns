@@ -22,6 +22,7 @@ func (e KeyNotFound) Error() string {
 
 type KeyExpired struct {
 	Key string
+	Msg *dns.Msg
 }
 
 func (e KeyExpired) Error() string {
@@ -56,6 +57,29 @@ type Cache interface {
 	Full() bool
 }
 
+type NoCache struct {
+}
+
+func (c *NoCache) Get(key string) (Msg *dns.Msg, err error) {
+	return nil, KeyNotFound{key}
+}
+
+func (c *NoCache) Set(key string, Msg *dns.Msg) error {
+	return nil
+}
+
+func (c *NoCache) Exists(key string) bool {
+	return false
+}
+
+func (c *NoCache) Remove(key string) error {
+	return nil
+}
+
+func (c *NoCache) Full() bool {
+	return false
+}
+
 type MemoryCache struct {
 	Backend  map[string]Mesg
 	Expire   time.Duration
@@ -73,7 +97,7 @@ func (c *MemoryCache) Get(key string) (*dns.Msg, error) {
 
 	if mesg.Expire.Before(time.Now()) {
 		c.Remove(key)
-		return nil, KeyExpired{key}
+		return nil, KeyExpired{key, mesg.Msg}
 	}
 
 	return mesg.Msg, nil

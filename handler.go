@@ -4,6 +4,8 @@ import (
 	"net"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/miekg/dns"
 )
 
@@ -27,6 +29,7 @@ type GODNSHandler struct {
 	resolver        *Resolver
 	cache, negCache Cache
 	hosts           Hosts
+	refreshGroup    *singleflight.Group
 }
 
 func NewHandler() *GODNSHandler {
@@ -47,25 +50,37 @@ func NewHandler() *GODNSHandler {
 			Expire:   time.Duration(cacheConfig.Expire) * time.Second,
 			Maxcount: cacheConfig.Maxcount,
 		}
-		negCache = &MemoryCache{
-			Backend:  make(map[string]Mesg),
-			Expire:   time.Duration(cacheConfig.Expire) * time.Second / 2,
-			Maxcount: cacheConfig.Maxcount,
+		if cacheConfig.NoNegative {
+			negCache = &NoCache{}
+		} else {
+			negCache = &MemoryCache{
+				Backend:  make(map[string]Mesg),
+				Expire:   time.Duration(cacheConfig.Expire) * time.Second / 2,
+				Maxcount: cacheConfig.Maxcount,
+			}
 		}
 	case "memcache":
 		cache = NewMemcachedCache(
 			settings.Memcache.Servers,
 			int32(cacheConfig.Expire))
-		negCache = NewMemcachedCache(
-			settings.Memcache.Servers,
-			int32(cacheConfig.Expire/2))
+		if cacheConfig.NoNegative {
+			negCache = &NoCache{}
+		} else {
+			negCache = NewMemcachedCache(
+				settings.Memcache.Servers,
+				int32(cacheConfig.Expire/2))
+		}
 	case "redis":
 		cache = NewRedisCache(
 			settings.Redis,
 			int64(cacheConfig.Expire))
-		negCache = NewRedisCache(
-			settings.Redis,
-			int64(cacheConfig.Expire/2))
+		if cacheConfig.NoNegative {
+			negCache = &NoCache{}
+		} else {
+			negCache = NewRedisCache(
+				settings.Redis,
+				int64(cacheConfig.Expire/2))
+		}
 	default:
 		logger.Error("Invalid cache backend %s", cacheConfig.Backend)
 		panic("Invalid cache backend")
@@ -76,7 +91,7 @@ func NewHandler() *GODNSHandler {
 		hosts = NewHosts(settings.Hosts, settings.Redis)
 	}
 
-	return &GODNSHandler{resolver, cache, negCache, hosts}
+	return &GODNSHandler{resolver, cache, negCache, hosts, &singleflight.Group{}}
 }
 
 func (h *GODNSHandler) do(Net string, w dns.ResponseWriter, req *dns.Msg) {
@@ -132,10 +147,24 @@ func (h *GODNSHandler) do(Net string, w dns.ResponseWriter, req *dns.Msg) {
 		}
 	}
 
+	writeMsgFromCache := func(m *dns.Msg) {
+		// we need this copy against concurrent modification of Id
+		msg := *m
+		msg.Id = req.Id
+		w.WriteMsg(&msg)
+	}
+
 	key := KeyGen(Q)
 	mesg, err := h.cache.Get(key)
 	if err != nil {
-		if mesg, err = h.negCache.Get(key); err != nil {
+		if errExpired, ok := err.(KeyExpired); ok {
+			logger.Debug("%s return old cache and refresh", Q.String())
+			writeMsgFromCache(errExpired.Msg)
+			// refresh cache now
+			go h.refresh(key, Q, Net, req)
+			return
+		}
+		if _, err = h.negCache.Get(key); err != nil {
 			logger.Debug("%s didn't hit cache", Q.String())
 		} else {
 			logger.Debug("%s hit negative cache", Q.String())
@@ -144,10 +173,7 @@ func (h *GODNSHandler) do(Net string, w dns.ResponseWriter, req *dns.Msg) {
 		}
 	} else {
 		logger.Debug("%s hit cache", Q.String())
-		// we need this copy against concurrent modification of Id
-		msg := *mesg
-		msg.Id = req.Id
-		w.WriteMsg(&msg)
+		writeMsgFromCache(mesg)
 		return
 	}
 
@@ -173,6 +199,27 @@ func (h *GODNSHandler) do(Net string, w dns.ResponseWriter, req *dns.Msg) {
 		}
 		logger.Debug("Insert %s into cache", Q.String())
 	}
+}
+
+func (h *GODNSHandler) refresh(key string, Q Question, Net string, req *dns.Msg) {
+	// use singleflight.Group to ensure only one query is executing for same key.
+	h.refreshGroup.Do(key, func() (v interface{}, err error) {
+		mesg, err := h.resolver.Lookup(Net, req)
+
+		if err != nil {
+			logger.Debug("Resolve query on refresh error %s", err)
+			return
+		}
+
+		if len(mesg.Answer) > 0 {
+			err = h.cache.Set(key, mesg)
+			if err != nil {
+				logger.Debug("Set %s cache failed on refresh: %s", Q.String(), err.Error())
+			}
+			logger.Debug("Insert %s into cache on refresh", Q.String())
+		}
+		return
+	})
 }
 
 func (h *GODNSHandler) DoTCP(w dns.ResponseWriter, req *dns.Msg) {
