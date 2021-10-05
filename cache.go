@@ -96,7 +96,7 @@ func (c *MemoryCache) Get(key string) (*dns.Msg, error) {
 	}
 
 	if mesg.Expire.Before(time.Now()) {
-		c.Remove(key)
+		// do not remove key from cache
 		return nil, KeyExpired{key, mesg.Msg}
 	}
 
